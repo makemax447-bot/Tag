@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 بوت إعادة نشر حسابات ببجي - Multi-tenant Forward Bot
@@ -17,6 +18,7 @@
 """
 
 import os
+import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta
@@ -102,6 +104,13 @@ def get_trader(trader_db_id):
     return row
 
 
+def get_trader_by_telegram_id(telegram_id):
+    conn = db_connect()
+    row = conn.execute("SELECT * FROM traders WHERE telegram_id=?", (telegram_id,)).fetchone()
+    conn.close()
+    return row
+
+
 def get_traders_by_status(status):
     conn = db_connect()
     rows = conn.execute("SELECT * FROM traders WHERE status=?", (status,)).fetchall()
@@ -125,11 +134,52 @@ def set_status(trader_db_id, status, extend=False):
 
 # ----------------------- تسجيل التاجر (Conversation) -----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.effective_user.id
+    trader = get_trader_by_telegram_id(telegram_id)
+
+    if trader:
+        if trader["status"] == "active":
+            remaining_text = "غير معروف"
+            if trader["expires_at"]:
+                try:
+                    expires = datetime.fromisoformat(trader["expires_at"])
+                    remaining_days = max((expires - datetime.utcnow()).days, 0)
+                    remaining_text = f"{remaining_days} يوم"
+                except ValueError:
+                    pass
+            status_text = f"✅ اشتراكك فعّال حاليًا\nمتبقي: {remaining_text}"
+        elif trader["status"] == "pending":
+            status_text = "⏳ طلبك قيد المراجعة من الأدمن، هيتفعّل بعد الدفع."
+        else:  # expired
+            status_text = f"⛔ اشتراكك منتهي.\nكلم الأدمن @{ADMIN_USERNAME} عشان تجدد."
+
+        keyboard = [[InlineKeyboardButton("🔄 تحديث بياناتي", callback_data="update_data")]]
+        await update.message.reply_text(
+            f"أهلاً بيك تاني 👋\n\n"
+            f"يوزرك: {trader['trader_username']}\n"
+            f"قناتك: {trader['channel_title']}\n\n"
+            f"{status_text}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text(
         "أهلاً بيك 👋\n"
         "البوت ده بينقل منشورات حسابات ببجي أوتوماتيك من الجروب الرسمي لقناتك.\n\n"
         "الاشتراك: 5$ شهريًا.\n\n"
         "عشان نبدأ، ابعتلي اليوزر بتاعك (اللي عايز يظهر مع منشوراتك):"
+    )
+    return ASK_USERNAME
+
+
+async def start_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يبدأ من زرار 'تحديث بياناتي' - بيرجع نفس خطوات التسجيل."""
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "تمام، هنحدّث بياناتك ✏️\n"
+        "لازم التحديث يتراجع من الأدمن قبل ما يتفعّل تاني.\n\n"
+        "ابعتلي اليوزر بتاعك:"
     )
     return ASK_USERNAME
 
@@ -315,22 +365,68 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------- إعادة النشر من الجروب الرسمي -----------------------
+MEDIA_GROUP_WAIT = 2  # ثواني الانتظار لتجميع كل عناصر الألبوم الواحد
+media_groups = {}  # media_group_id -> {"chat_id", "message_ids", "has_caption", "task"}
+
+
 async def relay_source_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg.chat_id != SOURCE_GROUP_ID:
         return
-    # فلتر: لازم فيديو + وصف (كابشن) عشان يعتبر "عرض حساب"
-    if not msg.video or not msg.caption:
+
+    # ألبوم (صورة + فيديو مع بعض أو أكتر من عنصر) - لازم نجمعه الأول
+    if msg.media_group_id:
+        await collect_media_group_message(msg, context)
         return
 
+    # رسالة مفردة: لازم (فيديو أو صورة) + وصف عشان تعتبر "عرض حساب"
+    if not (msg.video or msg.photo) or not msg.caption:
+        return
+
+    await broadcast_messages(context, msg.chat_id, [msg.message_id])
+
+
+async def collect_media_group_message(msg, context: ContextTypes.DEFAULT_TYPE):
+    gid = msg.media_group_id
+    group = media_groups.setdefault(
+        gid, {"chat_id": msg.chat_id, "message_ids": [], "has_caption": False, "task": None}
+    )
+    group["message_ids"].append(msg.message_id)
+    if msg.caption:
+        group["has_caption"] = True
+
+    if group["task"] is None:
+        group["task"] = asyncio.create_task(flush_media_group(gid, context))
+
+
+async def flush_media_group(gid: str, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.sleep(MEDIA_GROUP_WAIT)
+    group = media_groups.pop(gid, None)
+    if not group:
+        return
+    if not group["has_caption"]:
+        # الألبوم من غير وصف على أي عنصر فيه - متعتبرش عرض حساب
+        return
+    await broadcast_messages(context, group["chat_id"], group["message_ids"])
+
+
+async def broadcast_messages(context: ContextTypes.DEFAULT_TYPE, source_chat_id, message_ids):
     active_traders = get_traders_by_status("active")
+    ids_sorted = sorted(message_ids)
     for t in active_traders:
         try:
-            await context.bot.copy_message(
-                chat_id=t["channel_id"],
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id,
-            )
+            if len(ids_sorted) == 1:
+                await context.bot.copy_message(
+                    chat_id=t["channel_id"],
+                    from_chat_id=source_chat_id,
+                    message_id=ids_sorted[0],
+                )
+            else:
+                await context.bot.copy_messages(
+                    chat_id=t["channel_id"],
+                    from_chat_id=source_chat_id,
+                    message_ids=ids_sorted,
+                )
         except Exception as e:
             logger.warning(f"فشل النشر لقناة {t['channel_id']}: {e}")
 
@@ -361,7 +457,10 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     reg_conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(start_update, pattern="^update_data$"),
+        ],
         states={
             ASK_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_username)],
             ASK_CHANNEL: [MessageHandler(filters.TEXT | filters.FORWARDED, ask_channel)],
@@ -372,7 +471,11 @@ def main():
 
     app.add_handler(reg_conv)
     app.add_handler(CommandHandler("admin", admin_panel))
-    app.add_handler(CallbackQueryHandler(admin_callback))
+    app.add_handler(
+        CallbackQueryHandler(
+            admin_callback, pattern="^(list_|back_main|view_|activate_|deactivate_)"
+        )
+    )
     app.add_handler(MessageHandler(filters.Chat(SOURCE_GROUP_ID), relay_source_post))
 
     if app.job_queue:
