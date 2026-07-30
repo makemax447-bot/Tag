@@ -54,6 +54,10 @@ DEFAULT_EXCLUDE_KEYWORDS = [
     "داير على حساب",
 ]
 
+# ثواني الانتظار بين كل منشور والتاني عند النشر (عشان الترتيب يفضل مظبوط
+# ومايحصلش تزاحم/فلود لو نزل منشورات كتير مرة واحدة على الجروب)
+BROADCAST_DELAY_SECONDS = float(os.environ.get("BROADCAST_DELAY_SECONDS", "3"))
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -466,8 +470,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------- إعادة النشر من الجروب الرسمي -----------------------
+# ----------------------- إعادة النشر من الجروب الرسمي -----------------------
 MEDIA_GROUP_WAIT = 2  # ثواني الانتظار لتجميع كل عناصر الألبوم الواحد
-media_groups = {}  # media_group_id -> {"chat_id", "message_ids", "has_caption", "task"}
+media_groups = {}  # media_group_id -> {"chat_id", "message_ids", "caption", "task"}
+broadcast_queue = asyncio.Queue()  # طابور المنشورات المنتظرة النشر بالترتيب
 
 
 async def relay_source_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -491,7 +497,7 @@ async def relay_source_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if caption_is_excluded(msg.caption):
         return
 
-    await broadcast_messages(context, msg.chat_id, [msg.message_id], msg.caption)
+    await broadcast_queue.put((msg.chat_id, [msg.message_id], msg.caption))
 
 
 async def collect_media_group_message(msg, context: ContextTypes.DEFAULT_TYPE):
@@ -517,7 +523,21 @@ async def flush_media_group(gid: str, context: ContextTypes.DEFAULT_TYPE):
         return
     if caption_is_excluded(group["caption"]):
         return
-    await broadcast_messages(context, group["chat_id"], group["message_ids"], group["caption"])
+    await broadcast_queue.put((group["chat_id"], group["message_ids"], group["caption"]))
+
+
+async def broadcast_worker(bot):
+    """بيسحب المنشورات من الطابور وينشرها واحد ورا التاني بالترتيب،
+    مع وقفة صغيرة بين كل منشور والتاني عشان الترتيب يفضل مظبوط ومايحصلش فلود."""
+    while True:
+        source_chat_id, message_ids, caption = await broadcast_queue.get()
+        try:
+            await broadcast_messages(bot, source_chat_id, message_ids, caption)
+        except Exception as e:
+            logger.warning(f"فشل النشر: {e}")
+        finally:
+            broadcast_queue.task_done()
+        await asyncio.sleep(BROADCAST_DELAY_SECONDS)
 
 
 def caption_is_excluded(caption: str) -> bool:
@@ -535,9 +555,7 @@ def build_final_caption(original_caption: str, trader_username: str) -> str:
     return f"{original_caption}\n\n📩 للتواصل: @{username}"
 
 
-async def broadcast_messages(
-    context: ContextTypes.DEFAULT_TYPE, source_chat_id, message_ids, original_caption: str
-):
+async def broadcast_messages(bot, source_chat_id, message_ids, original_caption: str):
     active_traders = get_traders_by_status("active")
     ids_sorted = sorted(message_ids)
     for t in active_traders:
@@ -545,7 +563,7 @@ async def broadcast_messages(
         try:
             if len(ids_sorted) == 1:
                 # رسالة مفردة: بنستبدل الكابشن مباشرة أثناء النسخ
-                await context.bot.copy_message(
+                await bot.copy_message(
                     chat_id=t["channel_id"],
                     from_chat_id=source_chat_id,
                     message_id=ids_sorted[0],
@@ -553,13 +571,13 @@ async def broadcast_messages(
                 )
             else:
                 # ألبوم: بننسخه من غير كابشن، وبعدين نبعت الوصف النهائي كرسالة منفصلة
-                await context.bot.copy_messages(
+                await bot.copy_messages(
                     chat_id=t["channel_id"],
                     from_chat_id=source_chat_id,
                     message_ids=ids_sorted,
                     remove_caption=True,
                 )
-                await context.bot.send_message(
+                await bot.send_message(
                     chat_id=t["channel_id"],
                     text=final_caption,
                 )
@@ -588,9 +606,14 @@ async def check_expired(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ----------------------- تشغيل البوت -----------------------
+async def on_startup(app: Application):
+    """بتتنفذ مرة واحدة لما البوت يبدأ - بتشغّل عامل النشر بالترتيب."""
+    app.create_task(broadcast_worker(app.bot))
+
+
 def main():
     init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(on_startup).build()
 
     reg_conv = ConversationHandler(
         entry_points=[
@@ -628,4 +651,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
