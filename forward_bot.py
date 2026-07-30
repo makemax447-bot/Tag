@@ -45,6 +45,15 @@ ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Bobeka11")
 SUBSCRIPTION_DAYS = 30
 DB_PATH = os.environ.get("DB_PATH", "traders.db")
 
+# كلمات لو ظهرت في الوصف، المنشور مش بيتنشر (زي طلبات الشراء مش عروض البيع)
+DEFAULT_EXCLUDE_KEYWORDS = [
+    "مطلوب",
+    "طلب حساب",
+    "محتاج حساب",
+    "بدور على حساب",
+    "داير على حساب",
+]
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -77,6 +86,46 @@ def init_db():
             expires_at TEXT
         )
         """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key='exclude_keywords'"
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('exclude_keywords', ?)",
+            (",".join(DEFAULT_EXCLUDE_KEYWORDS),),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_exclude_keywords():
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key='exclude_keywords'"
+    ).fetchone()
+    conn.close()
+    if not row or not row["value"]:
+        return []
+    return [k.strip() for k in row["value"].split(",") if k.strip()]
+
+
+def set_exclude_keywords(keywords):
+    conn = db_connect()
+    conn.execute(
+        """
+        INSERT INTO settings (key, value) VALUES ('exclude_keywords', ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (",".join(keywords),),
     )
     conn.commit()
     conn.close()
@@ -276,6 +325,55 @@ def is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ADMIN_ID
 
 
+async def list_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    keywords = get_exclude_keywords()
+    if keywords:
+        text = "🚫 الكلمات المستبعدة حاليًا (أي منشور فيها متتنشرش):\n" + "\n".join(
+            f"- {k}" for k in keywords
+        )
+    else:
+        text = "مفيش كلمات مستبعدة حاليًا."
+    text += (
+        "\n\nلإضافة كلمة: /addkeyword الكلمة\n"
+        "لحذف كلمة: /delkeyword الكلمة"
+    )
+    await update.message.reply_text(text)
+
+
+async def add_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("اكتب الكلمة بعد الأمر، مثال:\n/addkeyword مطلوب")
+        return
+    word = " ".join(context.args).strip()
+    keywords = get_exclude_keywords()
+    if word in keywords:
+        await update.message.reply_text("الكلمة دي موجودة بالفعل في القائمة.")
+        return
+    keywords.append(word)
+    set_exclude_keywords(keywords)
+    await update.message.reply_text(f'تمت إضافة "{word}" لقائمة الاستبعاد ✅')
+
+
+async def del_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not context.args:
+        await update.message.reply_text("اكتب الكلمة بعد الأمر، مثال:\n/delkeyword مطلوب")
+        return
+    word = " ".join(context.args).strip()
+    keywords = get_exclude_keywords()
+    if word not in keywords:
+        await update.message.reply_text("الكلمة دي مش موجودة في القائمة أصلاً.")
+        return
+    keywords.remove(word)
+    set_exclude_keywords(keywords)
+    await update.message.reply_text(f'تم حذف "{word}" من قائمة الاستبعاد ✅')
+
+
 def build_admin_keyboard(status_filter):
     rows = get_traders_by_status(status_filter)
     buttons = []
@@ -390,17 +488,20 @@ async def relay_source_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (msg.video or msg.photo) or not msg.caption:
         return
 
-    await broadcast_messages(context, msg.chat_id, [msg.message_id])
+    if caption_is_excluded(msg.caption):
+        return
+
+    await broadcast_messages(context, msg.chat_id, [msg.message_id], msg.caption)
 
 
 async def collect_media_group_message(msg, context: ContextTypes.DEFAULT_TYPE):
     gid = msg.media_group_id
     group = media_groups.setdefault(
-        gid, {"chat_id": msg.chat_id, "message_ids": [], "has_caption": False, "task": None}
+        gid, {"chat_id": msg.chat_id, "message_ids": [], "caption": None, "task": None}
     )
     group["message_ids"].append(msg.message_id)
     if msg.caption:
-        group["has_caption"] = True
+        group["caption"] = msg.caption
 
     if group["task"] is None:
         group["task"] = asyncio.create_task(flush_media_group(gid, context))
@@ -411,28 +512,56 @@ async def flush_media_group(gid: str, context: ContextTypes.DEFAULT_TYPE):
     group = media_groups.pop(gid, None)
     if not group:
         return
-    if not group["has_caption"]:
+    if not group["caption"]:
         # الألبوم من غير وصف على أي عنصر فيه - متعتبرش عرض حساب
         return
-    await broadcast_messages(context, group["chat_id"], group["message_ids"])
+    if caption_is_excluded(group["caption"]):
+        return
+    await broadcast_messages(context, group["chat_id"], group["message_ids"], group["caption"])
 
 
-async def broadcast_messages(context: ContextTypes.DEFAULT_TYPE, source_chat_id, message_ids):
+def caption_is_excluded(caption: str) -> bool:
+    """بيرجع True لو الوصف فيه كلمة من قائمة الاستبعاد (زي 'مطلوب')."""
+    if not caption:
+        return False
+    keywords = get_exclude_keywords()
+    return any(kw and kw in caption for kw in keywords)
+
+
+def build_final_caption(original_caption: str, trader_username: str) -> str:
+    username = (trader_username or "").strip().lstrip("@")
+    if not username:
+        return original_caption
+    return f"{original_caption}\n\n📩 للتواصل: @{username}"
+
+
+async def broadcast_messages(
+    context: ContextTypes.DEFAULT_TYPE, source_chat_id, message_ids, original_caption: str
+):
     active_traders = get_traders_by_status("active")
     ids_sorted = sorted(message_ids)
     for t in active_traders:
+        final_caption = build_final_caption(original_caption, t["trader_username"])
         try:
             if len(ids_sorted) == 1:
+                # رسالة مفردة: بنستبدل الكابشن مباشرة أثناء النسخ
                 await context.bot.copy_message(
                     chat_id=t["channel_id"],
                     from_chat_id=source_chat_id,
                     message_id=ids_sorted[0],
+                    caption=final_caption,
                 )
             else:
+                # ألبوم: بننسخه من غير كابشن، وبعدين نبعت الوصف النهائي كرسالة منفصلة
                 await context.bot.copy_messages(
                     chat_id=t["channel_id"],
                     from_chat_id=source_chat_id,
                     message_ids=ids_sorted,
+                    remove_caption=True,
+                )
+                await context.bot.send_message(
+                    chat_id=t["channel_id"],
+                    text=final_caption,
                 )
         except Exception as e:
             logger.warning(f"فشل النشر لقناة {t['channel_id']}: {e}")
@@ -478,6 +607,9 @@ def main():
 
     app.add_handler(reg_conv)
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("keywords", list_keywords))
+    app.add_handler(CommandHandler("addkeyword", add_keyword))
+    app.add_handler(CommandHandler("delkeyword", del_keyword))
     app.add_handler(
         CallbackQueryHandler(
             admin_callback, pattern="^(list_|back_main|view_|activate_|deactivate_)"
