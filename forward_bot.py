@@ -1,20 +1,24 @@
-
 # -*- coding: utf-8 -*-
 """
 بوت إعادة نشر حسابات ببجي - Multi-tenant Forward Bot
 ------------------------------------------------------
 الفكرة:
-  - جروب رسمي واحد فيه منشورات (فيديو + وصف) لحسابات ببجي معروضة.
-  - تجار كتير بيشتركوا (5$/شهر، دفع يدوي خارج البوت).
-  - كل منشور جديد فيه فيديو ووصف في الجروب الرسمي، بيتحول أوتوماتيك
+  - البوت يشتغل تلقائي في أي جروب "عرض حسابات" يتضاف فيه كأدمن (مفيش
+    جروب واحد ثابت متحدد بالـ ID - أي جروب البوت أدمن فيه بيبقى مصدر).
+  - تجار كتير بيشتركوا (5$/شهر، دفع يدوي خارج البوت) وبيسجلوا يوزرهم
+    وقناتهم الخاصة.
+  - أي منشور جديد فيه فيديو/صورة ووصف في أي جروب من دول، بيتحول أوتوماتيك
     لقنوات كل التجار الـ Active.
   - الأدمن (انت) عنده لوحة تحكم جوه البوت لتفعيل/إيقاف/تجديد التجار.
 
 الإعداد قبل التشغيل (غيّر القيم دي في الأسفل أو حطها Environment Variables):
   BOT_TOKEN        - توكن البوت من BotFather
   ADMIN_ID         - رقم التليجرام آيدي بتاعك (مش اليوزر)
-  SOURCE_GROUP_ID  - آيدي الجروب الرسمي (رقم سالب زي -1001234567890)
   ADMIN_USERNAME   - يوزرك للتواصل (بدون @) - بيظهر للتاجر عشان يدفع
+
+ملحوظة مهمة: عشان البوت يستقبل رسائل أي جروب "عرض حسابات"، لازم يتضاف
+فيه كـ Admin (مش عضو عادي بس) - كده تليجرام بيبعتله كل الرسائل حتى لو
+Privacy Mode شغال في إعدادات BotFather.
 """
 
 import os
@@ -37,7 +41,6 @@ from telegram.ext import (
 # ----------------------- الإعدادات -----------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8357386417:AAFWkKuCdQviXOXy4kViPah1pJZKgZLFNTE")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "429325696"))  # حط آيدي التليجرام بتاعك
-SOURCE_GROUP_ID = int(os.environ.get("SOURCE_GROUP_ID", "-1005471960213"))  # آيدي الجروب الرسمي
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "Bobeka11")
 SUBSCRIPTION_DAYS = 30
 DB_PATH = os.environ.get("DB_PATH", "traders.db")
@@ -371,7 +374,11 @@ media_groups = {}  # media_group_id -> {"chat_id", "message_ids", "has_caption",
 
 async def relay_source_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    if msg.chat_id != SOURCE_GROUP_ID:
+    chat = update.effective_chat
+
+    # أي جروب أو سوبرجروب البوت أدمن/عضو فيه بيتعامل كمصدر أوتوماتيك.
+    # (القنوات مش بتدخل هنا أصلًا - دي وجهة النشر مش مصدره)
+    if chat.type not in ("group", "supergroup"):
         return
 
     # ألبوم (صورة + فيديو مع بعض أو أكتر من عنصر) - لازم نجمعه الأول
@@ -476,7 +483,9 @@ def main():
             admin_callback, pattern="^(list_|back_main|view_|activate_|deactivate_)"
         )
     )
-    app.add_handler(MessageHandler(filters.Chat(SOURCE_GROUP_ID), relay_source_post))
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS, relay_source_post)
+    )
 
     if app.job_queue:
         app.job_queue.run_repeating(check_expired, interval=3600, first=10)
@@ -487,3 +496,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
